@@ -39,6 +39,9 @@ plt.rcParams["font.family"] = [
 ]
 plt.rcParams["axes.unicode_minus"] = False
 
+# ---------- 大規模データの閾値 ----------
+LARGE_DATA_THRESHOLD = 10000  # これ以上はサンプリングで高速化
+
 
 # ============================================================
 # 1. ファイル読み込み
@@ -46,7 +49,13 @@ plt.rcParams["axes.unicode_minus"] = False
 def load_data(filepath: str) -> pd.DataFrame:
     p = Path(filepath)
     if p.suffix == ".csv":
-        return pd.read_csv(filepath)
+        # 文字コードを自動判定して読み込む
+        for encoding in ["utf-8", "utf-8-sig", "shift_jis", "cp932", "euc-jp", "iso-8859-1"]:
+            try:
+                return pd.read_csv(filepath, encoding=encoding)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        sys.exit(f"[エラー] CSVの文字コードを判定できませんでした: {filepath}")
     elif p.suffix in (".xlsx", ".xls"):
         return pd.read_excel(filepath)
     else:
@@ -66,8 +75,8 @@ def detect_column_types(df: pd.DataFrame) -> dict:
         if len(series) == 0:
             col_types[col] = "unknown"
             continue
-        # ① 日付判定
-        if _is_date_column(series):
+        # ① 日付判定（数値型は日付としない）
+        if not pd.api.types.is_numeric_dtype(series) and _is_date_column(series):
             col_types[col] = "date"
             continue
         # ② 数値判定
@@ -82,12 +91,18 @@ def detect_column_types(df: pd.DataFrame) -> dict:
 def _is_date_column(series: pd.Series) -> bool:
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
-    if pd.api.types.is_string_dtype(series):
+    if pd.api.types.is_string_dtype(series) or series.dtype == object:
         sample = series.head(min(50, len(series)))
+        # 純粋な数値文字列（"2020", "123"等）は日付にしない
+        try:
+            pd.to_numeric(sample)
+            return False  # 数値に変換可能 → 日付ではない
+        except (ValueError, TypeError):
+            pass
         try:
             parsed = pd.to_datetime(sample, format="mixed")
             return parsed.notna().mean() > 0.8
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             return False
     return False
 
@@ -95,12 +110,28 @@ def _is_date_column(series: pd.Series) -> bool:
 def _is_numeric_column(series: pd.Series) -> bool:
     if pd.api.types.is_numeric_dtype(series):
         return True
-    if pd.api.types.is_string_dtype(series):
+    if pd.api.types.is_string_dtype(series) or series.dtype == object:
         try:
             pd.to_numeric(series)
             return True
         except (ValueError, TypeError):
             return False
+    return False
+
+
+def _is_id_like_numeric(series: pd.Series) -> bool:
+    """連番的な整数列（ID）かどうかを判定する。"""
+    num = pd.to_numeric(series, errors="coerce").dropna()
+    if len(num) == 0:
+        return False
+    # 小数点を含むなら連続値 → IDではない
+    if not np.all(num == num.astype(int)):
+        return False
+    # 値がほぼ連番（差分が一定）ならIDの可能性が高い
+    sorted_vals = np.sort(num.values)
+    diffs = np.diff(sorted_vals)
+    if len(diffs) > 0 and np.std(diffs) < 1.0 and np.mean(diffs) > 0:
+        return True
     return False
 
 
@@ -115,8 +146,18 @@ def columns_to_exclude(df: pd.DataFrame, col_types: dict) -> list:
 
         # ユニーク率 > 80%
         if n > 0 and n_unique / n > 0.8:
-            excluded.append(col)
-            continue
+            ctype = col_types.get(col)
+            if ctype == "numeric":
+                # 数値型は連続値の可能性があるため、ID的な列のみ除外
+                if _is_id_like_numeric(series):
+                    excluded.append(col)
+                    continue
+                # 連続数値はユニーク率が高くても除外しない
+            else:
+                # カテゴリ・日付・不明型はユニーク率が高ければ除外
+                excluded.append(col)
+                continue
+
         # 欠損率 > 50%
         if n > 0 and n_missing / n > 0.5:
             excluded.append(col)
@@ -148,11 +189,19 @@ def encode_columns(df: pd.DataFrame, col_types: dict, excluded: list) -> pd.Data
                 frames.append(result)
 
     if not frames:
-        sys.exit("[エラー] 有効な特徴量がありません。")
+        sys.exit("[エラー] 有効な特徴量がありません。データを確認してください。")
 
     encoded = pd.concat(frames, axis=1)
+    # 重複カラム名を解消
+    if encoded.columns.duplicated().any():
+        encoded.columns = [
+            f"{c}_{i}" if dup else c
+            for i, (c, dup) in enumerate(zip(encoded.columns, encoded.columns.duplicated()))
+        ]
     # 残存 NaN を 0 埋め
     encoded = encoded.fillna(0)
+    # inf を除去
+    encoded = encoded.replace([np.inf, -np.inf], 0)
     return encoded
 
 
@@ -167,14 +216,15 @@ def _encode_date(df: pd.DataFrame, col: str) -> pd.DataFrame:
     dt = pd.to_datetime(df[col], errors="coerce")
     min_date = dt.min()
     features = pd.DataFrame(index=df.index)
-    features[f"{col}_elapsed_days"] = (dt - min_date).dt.days.fillna(0)
+    elapsed = (dt - min_date).dt.days
+    features[f"{col}_elapsed_days"] = elapsed.fillna(0)
     features[f"{col}_year"] = dt.dt.year.fillna(0)
     features[f"{col}_month"] = dt.dt.month.fillna(0)
     features[f"{col}_dayofweek"] = dt.dt.dayofweek.fillna(0)
-    features[f"{col}_is_weekend"] = (dt.dt.dayofweek >= 5).astype(int)
+    features[f"{col}_is_weekend"] = dt.dt.dayofweek.fillna(0).apply(lambda x: 1 if x >= 5 else 0)
 
     scaler = StandardScaler()
-    scaled = scaler.fit_transform(features.values)
+    scaled = scaler.fit_transform(features.values.astype(float))
     return pd.DataFrame(scaled, columns=features.columns, index=df.index)
 
 
@@ -205,20 +255,28 @@ def generate_column_sets(encoded: pd.DataFrame) -> dict:
     sets["all"] = encoded.copy()
 
     # drop_corr: 相関係数 > 0.95 の片方を除外
-    corr_matrix = encoded.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [c for c in upper.columns if any(upper[c] > 0.95)]
-    if to_drop:
-        sets["drop_corr"] = encoded.drop(columns=to_drop)
+    if encoded.shape[1] >= 2:
+        corr_matrix = encoded.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [c for c in upper.columns if any(upper[c] > 0.95)]
+        dropped = encoded.drop(columns=to_drop)
+        # 全カラムが除去されないよう保護
+        if dropped.shape[1] >= 1:
+            sets["drop_corr"] = dropped
+        else:
+            sets["drop_corr"] = encoded.copy()
     else:
         sets["drop_corr"] = encoded.copy()
 
     # pca_95: 分散95%保持
     if encoded.shape[1] >= 2:
-        pca = PCA(n_components=0.95, random_state=RANDOM_STATE, svd_solver="full")
-        pca_data = pca.fit_transform(encoded.values)
-        pca_cols = [f"PC{i+1}" for i in range(pca_data.shape[1])]
-        sets["pca_95"] = pd.DataFrame(pca_data, columns=pca_cols, index=encoded.index)
+        try:
+            pca = PCA(n_components=0.95, random_state=RANDOM_STATE, svd_solver="full")
+            pca_data = pca.fit_transform(encoded.values)
+            pca_cols = [f"PC{i+1}" for i in range(pca_data.shape[1])]
+            sets["pca_95"] = pd.DataFrame(pca_data, columns=pca_cols, index=encoded.index)
+        except Exception:
+            pass  # PCA失敗時はスキップ
 
     return sets
 
@@ -233,58 +291,92 @@ def run_exploration(column_sets: dict) -> list:
         X = data_df.values
         n_samples = X.shape[0]
 
+        if n_samples < 3:
+            print(f"  [スキップ] {cs_name}: サンプル数が少なすぎます ({n_samples})")
+            continue
+
         # --- KMeans ---
         max_k = min(10, n_samples - 1)
         for k in range(2, max_k + 1):
-            labels = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10).fit_predict(X)
-            sil = silhouette_score(X, labels)
-            results.append({
-                "method": f"KMeans(k={k})",
-                "column_set": cs_name,
-                "n_clusters": k,
-                "silhouette": round(sil, 4),
-                "noise_ratio": None,
-                "labels": labels,
-            })
-
-        # --- Agglomerative ---
-        for linkage in ["ward", "complete", "average"]:
-            for k in range(2, max_k + 1):
-                labels = AgglomerativeClustering(
-                    n_clusters=k, linkage=linkage
-                ).fit_predict(X)
+            try:
+                labels = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10).fit_predict(X)
+                if len(set(labels)) < 2:
+                    continue
                 sil = silhouette_score(X, labels)
                 results.append({
-                    "method": f"Agglomerative({linkage},k={k})",
+                    "method": f"KMeans(k={k})",
                     "column_set": cs_name,
                     "n_clusters": k,
                     "silhouette": round(sil, 4),
                     "noise_ratio": None,
                     "labels": labels,
                 })
+            except Exception:
+                continue
+
+        # --- Agglomerative ---
+        # 大規模データではサンプリングして実行
+        if n_samples > LARGE_DATA_THRESHOLD:
+            print(f"  [情報] {cs_name}: データが大きいため Agglomerative はサンプリング実行 (n={LARGE_DATA_THRESHOLD})")
+            sample_idx = np.random.choice(n_samples, LARGE_DATA_THRESHOLD, replace=False)
+            X_agg = X[sample_idx]
+        else:
+            sample_idx = None
+            X_agg = X
+
+        for linkage in ["ward", "complete", "average"]:
+            for k in range(2, min(max_k + 1, X_agg.shape[0])):
+                try:
+                    model = AgglomerativeClustering(n_clusters=k, linkage=linkage)
+                    labels_agg = model.fit_predict(X_agg)
+                    if len(set(labels_agg)) < 2:
+                        continue
+                    sil = silhouette_score(X_agg, labels_agg)
+                    # サンプリングした場合は全データに対してラベルを再生成できないため
+                    # 近似的にKMeansで全データにラベルを割り当て
+                    if sample_idx is not None:
+                        from sklearn.neighbors import NearestCentroid
+                        nc = NearestCentroid()
+                        nc.fit(X_agg, labels_agg)
+                        full_labels = nc.predict(X)
+                    else:
+                        full_labels = labels_agg
+                    results.append({
+                        "method": f"Agglomerative({linkage},k={k})",
+                        "column_set": cs_name,
+                        "n_clusters": k,
+                        "silhouette": round(sil, 4),
+                        "noise_ratio": None,
+                        "labels": full_labels,
+                    })
+                except Exception:
+                    continue
 
         # --- DBSCAN ---
         eps_values = np.linspace(0.3, 2.0, 5)
         min_samples_values = [3, 5, 7, 10]
         for eps in eps_values:
             for ms in min_samples_values:
-                labels = DBSCAN(eps=eps, min_samples=ms).fit_predict(X)
-                n_clusters = len(set(labels) - {-1})
-                if n_clusters < 2:
+                try:
+                    labels = DBSCAN(eps=eps, min_samples=ms).fit_predict(X)
+                    n_clusters = len(set(labels) - {-1})
+                    if n_clusters < 2:
+                        continue
+                    mask = labels != -1
+                    if mask.sum() < 2:
+                        continue
+                    sil = silhouette_score(X[mask], labels[mask])
+                    noise_ratio = round((labels == -1).sum() / len(labels), 4)
+                    results.append({
+                        "method": f"DBSCAN(eps={eps:.2f},ms={ms})",
+                        "column_set": cs_name,
+                        "n_clusters": n_clusters,
+                        "silhouette": round(sil, 4),
+                        "noise_ratio": noise_ratio,
+                        "labels": labels,
+                    })
+                except Exception:
                     continue
-                mask = labels != -1
-                if mask.sum() < 2:
-                    continue
-                sil = silhouette_score(X[mask], labels[mask])
-                noise_ratio = round((labels == -1).sum() / len(labels), 4)
-                results.append({
-                    "method": f"DBSCAN(eps={eps:.2f},ms={ms})",
-                    "column_set": cs_name,
-                    "n_clusters": n_clusters,
-                    "silhouette": round(sil, 4),
-                    "noise_ratio": noise_ratio,
-                    "labels": labels,
-                })
 
     results.sort(key=lambda r: r["silhouette"], reverse=True)
     return results
@@ -318,6 +410,8 @@ def print_results(results: list, top_n: int = 10):
 # 5-2. 可視化
 def save_silhouette_ranking(results: list, output_dir: Path):
     top20 = results[:20]
+    if not top20:
+        return
     labels = [f"{r['method']}\n({r['column_set']})" for r in top20]
     values = [r["silhouette"] for r in top20]
     colors = ["#e74c3c" if v < 0 else "#3498db" for v in values]
@@ -348,29 +442,35 @@ def save_scatter(encoded: pd.DataFrame, labels: np.ndarray, method_name: str,
 
     # PCA
     if X_valid.shape[1] >= 2:
-        pca = PCA(n_components=2, random_state=RANDOM_STATE)
-        coords_pca = pca.fit_transform(X_valid)
-        _plot_scatter(coords_pca, labels_valid, method_name, "PCA",
-                      output_dir / f"scatter_top{rank}_pca.png")
+        try:
+            pca = PCA(n_components=2, random_state=RANDOM_STATE)
+            coords_pca = pca.fit_transform(X_valid)
+            _plot_scatter(coords_pca, labels_valid, method_name, "PCA",
+                          output_dir / f"scatter_top{rank}_pca.png")
+        except Exception:
+            pass
 
     # t-SNE
-    perplexity = min(30, X_valid.shape[0] - 1)
-    if perplexity >= 2:
-        tsne = TSNE(n_components=2, perplexity=perplexity, max_iter=1000,
-                     random_state=RANDOM_STATE)
-        coords_tsne = tsne.fit_transform(X_valid)
-        _plot_scatter(coords_tsne, labels_valid, method_name, "t-SNE",
-                      output_dir / f"scatter_top{rank}_tsne.png")
+    perplexity = min(30, max(2, X_valid.shape[0] // 3))
+    if X_valid.shape[0] >= 5:
+        try:
+            tsne = TSNE(n_components=2, perplexity=perplexity, max_iter=1000,
+                         random_state=RANDOM_STATE)
+            coords_tsne = tsne.fit_transform(X_valid)
+            _plot_scatter(coords_tsne, labels_valid, method_name, "t-SNE",
+                          output_dir / f"scatter_top{rank}_tsne.png")
+        except Exception:
+            pass
 
 
 def _plot_scatter(coords: np.ndarray, labels: np.ndarray, method: str,
                   proj: str, filepath: Path):
     fig, ax = plt.subplots(figsize=(8, 6))
     unique_labels = sorted(set(labels))
-    palette = sns.color_palette("tab10", len(unique_labels))
+    palette = sns.color_palette("tab10", max(len(unique_labels), 1))
     for idx, cl in enumerate(unique_labels):
         mask = labels == cl
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=[palette[idx]],
+        ax.scatter(coords[mask, 0], coords[mask, 1], c=[palette[idx % len(palette)]],
                    label=f"Cluster {cl}", s=20, alpha=0.7)
     ax.set_title(f"{method} — {proj} projection")
     ax.legend(fontsize=8, loc="best")
@@ -404,13 +504,13 @@ def save_cluster_profile(encoded: pd.DataFrame, labels: np.ndarray,
     angles += angles[:1]
 
     fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
-    palette = sns.color_palette("tab10", len(cluster_means))
+    palette = sns.color_palette("tab10", max(len(cluster_means), 1))
 
     for idx, (cl, row) in enumerate(cluster_means.iterrows()):
         values = row.tolist() + [row.iloc[0]]
         ax.plot(angles, values, "o-", linewidth=1.5, label=f"Cluster {cl}",
-                color=palette[idx])
-        ax.fill(angles, values, alpha=0.1, color=palette[idx])
+                color=palette[idx % len(palette)])
+        ax.fill(angles, values, alpha=0.1, color=palette[idx % len(palette)])
 
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(features, fontsize=7)
@@ -460,6 +560,9 @@ def main():
     print(f"[読み込み] {args.filepath}")
     df = load_data(args.filepath)
     print(f"  行数: {len(df)}, カラム数: {len(df.columns)}")
+
+    if len(df) < 3:
+        sys.exit("[エラー] データ行数が少なすぎます（最低3行必要）。")
 
     # 2. 前処理
     print("[前処理] カラム型の自動判定...")

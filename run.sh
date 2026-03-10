@@ -45,39 +45,27 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
 # ── in/ フォルダの確認 ──
-INPUT_DIR="in"
-if [ ! -d "$INPUT_DIR" ]; then
+if [ ! -d "in" ]; then
     echo "[エラー] in/ フォルダが見つかりません。入力データを in/ に配置してください。"
     exit 1
 fi
 
-# 入力ファイルを検出（CSV / Excel）
-INPUT_FILES=()
-while IFS= read -r -d '' f; do
-    INPUT_FILES+=("$f")
-done < <(find "$INPUT_DIR" -maxdepth 1 -type f \( -name "*.csv" -o -name "*.xlsx" -o -name "*.xls" \) -print0 | sort -z)
-
-if [ ${#INPUT_FILES[@]} -eq 0 ]; then
-    echo "[エラー] in/ にCSVまたはExcelファイルがありません。"
+CSV_COUNT=$(find "in" -maxdepth 1 -name "*.csv" -type f | wc -l)
+if [ "$CSV_COUNT" -eq 0 ]; then
+    echo "[エラー] in/ にCSVファイルがありません。"
     exit 1
 fi
 
 # ── 実行 ──
 echo "========================================"
-echo " 自動クラスタリング探索ツール"
+echo " 異常検知システム"
+echo " Isolation Forest + SHAP + PCA"
 echo "========================================"
 echo ""
 
-for filepath in "${INPUT_FILES[@]}"; do
-    filename="$(basename "$filepath")"
-    name="${filename%.*}"
-    output_dir="out/$name"
+python main.py
 
-    echo "──── 処理中: $filename → $output_dir/ ────"
-    python clustering_explorer.py "$filepath" --output "$output_dir" "$@"
-    echo ""
-done
-
+echo ""
 echo "========================================"
-echo " 全ファイルの処理が完了しました"
+echo " 処理完了 — 結果は out/ に出力されました"
 echo "========================================"

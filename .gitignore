@@ -1,4 +1,7 @@
-output/
+out/
+in/*
+!in/.gitkeep
+.venv/
 __pycache__/
 *.pyc
-test_data.csv
+.env

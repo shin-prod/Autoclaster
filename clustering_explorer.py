@@ -549,8 +549,8 @@ def main():
     parser.add_argument("filepath", help="入力ファイル (CSV / Excel)")
     parser.add_argument("--top", type=int, default=3,
                         help="上位何位まで散布図を出力するか (デフォルト: 3)")
-    parser.add_argument("--output", type=str, default="output",
-                        help="出力ディレクトリ (デフォルト: output)")
+    parser.add_argument("--output", type=str, default="out",
+                        help="出力ディレクトリ (デフォルト: out)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
